@@ -1,84 +1,111 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import io
 import pandas as pd
+import yfinance as yf
+from datetime import date, timedelta
 import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 from tensorflow.keras.models import load_model
-from azure.storage.blob import BlobServiceClient
-
 
 app = FastAPI()
 
-MODEL_CONTAINER_NAME = 'your_model_container_name'
-ACCOUNT_NAME = 'your_account_name'
-ACCOUNT_KEY = 'your_account_key'
+MODEL_PATHS = {
+    'AAPL': '../models/AAPL.h5',
+    'AMZN': '../models/AMZN.h5',
+    'GOOGL': '../models/GOOGL.h5',
+    'META': '../models/META.h5',
+    'MSFT': '../models/MSFT.h5'
+}
 
-def load_model_from_azure(account_name, account_key, container_name, stock_name):
-    """Load LSTM model from Azure Blob Storage based on stock name."""
-    try:
-        conn_str = f"DefaultEndpointsProtocol=https;AccountName={account_name};AccountKey={account_key};EndpointSuffix=core.windows.net"
-        blob_service_client = BlobServiceClient.from_connection_string(conn_str)
-        file_name = f"{stock_name.upper()}.h5"
-        blob_client = blob_service_client.get_blob_client(container=container_name, blob=file_name)
-        with open(file_name, "wb") as data:
-            data.write(blob_client.download_blob().readall())
-        model = load_model(file_name)
-        return model
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error loading model from Azure Blob Storage: {e}")
+# Define the features to be used for processing
+FEATURES = ['Close', 'Volume', 'Open', 'High', 'Low']
+
 
 class StockRequest(BaseModel):
     stock_name: str
-    stock_data: str
-
-def preprocess_stock_data(stock_data_df):
-    """Scale stock data and prepare input features for making predictions."""
-    features = ['Close/Last', 'Volume', 'Open', 'High', 'Low']
-
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    scaled_data = scaler.fit_transform(stock_data_df[features])
-
-    X = []
-    y = []
-    for i in range(scaled_data.shape[0] - 60, scaled_data.shape[0]):
-        X.append(scaled_data[i-60:i, :])
-        y.append(scaled_data[i, 0])
-
-    X = np.array(X)
-    y = np.array(y)
-
-    return X, scaler
 
 
 @app.post("/LSTM_Prediction")
 async def predict(stock_request: StockRequest):
     stock_name = stock_request.stock_name
-    stock_data = stock_request.stock_data
+
+    # Load the saved model based on stock name
+    try:
+        model = load_model(MODEL_PATHS[stock_name])
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model for stock '{stock_name}' not found"
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to load model: {e}"
+        )
 
     try:
-        model = load_model_from_azure(ACCOUNT_NAME, ACCOUNT_KEY, MODEL_CONTAINER_NAME, stock_name)
-    except HTTPException as e:
-        raise e
+        # Calculate the date range
+        end_date = date.today().strftime("%Y-%m-%d")
+        start_date = (date.today() - timedelta(days=90)).strftime("%Y-%m-%d")
+
+        # Download the data from Yahoo Finance
+        data = yf.download(stock_name, start=start_date, end=end_date)[FEATURES]
+
+        # Reset the index and clean up the data
+        data.reset_index(inplace=True)
+        data['Date'] = pd.to_datetime(data['Date']).dt.date
+        data[['Close', 'Open', 'High', 'Low']] = data[['Close', 'Open', 'High', 'Low']].round(3)
+        data = data.sort_values(by='Date')
+
+        # Flatten columns if MultiIndex exists
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = [' '.join(col).strip() for col in data.columns.values]
+
+        # Clean column names
+        data.columns = data.columns.str.replace(f' {stock_name}', '', regex=False)
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to load model: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred while loading data: {e}"
+        )
 
     try:
-        stock_data_df = pd.read_csv(io.StringIO(stock_data))
-        stock_data_df.columns = ['Date', 'Close/Last', 'Volume', 'Open', 'High', 'Low']
+        # Apply scaling
+        scaler = MinMaxScaler(feature_range=(0, 1))
+        scaled_data = scaler.fit_transform(data[FEATURES])
+
+        # Prepare the input data for prediction
+        X = []
+        y = []
+        for i in range(scaled_data.shape[0] - 30, scaled_data.shape[0]):
+            X.append(scaled_data[i - 30:i, :])  # Use all features as input
+            y.append(scaled_data[i, 0])  # Use the Close column as target
+
+        X = np.array(X)
+        y = np.array(y)
+
+
+        # Make predictions
+        predictions = model.predict(X)
+
+        # Prepare a placeholder array for predictions
+        # The first dimension matches predictions; the second dimension matches scaled_data columns
+        predicted_data = np.zeros((predictions.shape[0], scaled_data.shape[1]))
+
+        # Fill predictions in the first column
+        predicted_data[:, 0] = predictions.flatten()
+
+        # Inverse transform the predictions
+        predicted_data = scaler.inverse_transform(predicted_data)
+
+        # Convert predictions to a list of prices
+        predicted_prices = predicted_data[:, 0].tolist()
+
+        return {'prediction': predicted_prices}
+
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to load stock data from request: {e}")
-
-    X, scaler = preprocess_stock_data(stock_data_df)
-
-    predictions = model.predict(X)
-
-    predicted_data = np.zeros((60, 5))
-    predicted_data[:, 0] = predictions.flatten()
-
-    predicted_data = scaler.inverse_transform(predicted_data)
-
-    predicted_prices = predicted_data[:, 0].tolist()
-
-    return {'prediction': predicted_prices}
-
+        raise HTTPException(
+            status_code=500,
+            detail=f"An error occurred during prediction: {str(e)}"
+        )
