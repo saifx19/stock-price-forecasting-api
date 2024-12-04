@@ -3,4 +3,5 @@
 The models used in the project are from this [repository](https://github.com/saifx19/multivariate-lstm-stock-price-prediction).
 
 
-![Demo](https://github.com/saifx19/stock-price-forecasting-api/issues/1#issue-2716477387)
+https://github.com/user-attachments/assets/7b3f1de6-1993-45bd-b2c2-723c7e39f506
+
